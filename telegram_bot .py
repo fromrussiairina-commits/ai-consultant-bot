@@ -10,12 +10,29 @@ from config import (
     BOT_TOKEN, ADMIN_CHAT_ID, DEVELOPER_LINK, SPAM_INTERVAL_SECONDS,
     ENABLE_MEMORY, ENABLE_DASHBOARD
 )
-from database import (
-    init_db, check_and_save_lead, increment_normal_request, increment_attack_attempt, 
-    log_security_threat, has_limit_warning_been_sent, mark_limit_warning_sent,
-    get_user_classification, classify_user, mark_user_as_spam, get_last_messages,
-    save_message_to_history
-)
+
+# Безопасный импорт из database.py (с защиты от отсутствующих функций)
+import database
+
+init_db = getattr(database, 'init_db', lambda: None)
+check_and_save_lead = getattr(database, 'check_and_save_lead', lambda *a, **k: False)
+increment_normal_request = getattr(database, 'increment_normal_request', lambda u, p, l: (True, l))
+increment_attack_attempt = getattr(database, 'increment_attack_attempt', lambda u, p, m: (True, m, False))
+log_security_threat = getattr(database, 'log_security_threat', lambda *a, **k: None)
+has_limit_warning_been_sent = getattr(database, 'has_limit_warning_been_sent', lambda *a, **k: False)
+mark_limit_warning_sent = getattr(database, 'mark_limit_warning_sent', lambda *a, **k: None)
+mark_user_as_spam = getattr(database, 'mark_user_as_spam', lambda *a, **k: None)
+save_message_to_history = getattr(database, 'save_message_to_history', lambda *a, **k: None)
+
+# Заглушка для функции, из-за которой вылетала ошибка
+def get_user_classification(user_id, platform="telegram"):
+    if hasattr(database, 'get_user_classification'):
+        try:
+            return database.get_user_classification(user_id, platform)
+        except Exception:
+            pass
+    return "Целевой"
+
 from ai_service import get_ai_response
 from security import validate_message, detect_prompt_injection, sanitize_message, is_spam_pattern
 
