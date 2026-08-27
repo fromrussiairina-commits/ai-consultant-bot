@@ -3,6 +3,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ========== МОДУЛИ И ФИЧИ ==========
+ENABLE_MEMORY = False  # Включить модуль памяти? (платная фича)
+ENABLE_DASHBOARD = False  # Включить дашборд? (платная фича)
+
 # Telegram
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")

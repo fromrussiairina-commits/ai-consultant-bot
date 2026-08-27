@@ -6,10 +6,35 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
-from config import BOT_TOKEN, ADMIN_CHAT_ID, DEVELOPER_LINK, SPAM_INTERVAL_SECONDS
-from database import init_db, check_and_save_lead, increment_normal_request, increment_attack_attempt, log_security_threat, get_remaining_requests, has_limit_warning_been_sent, mark_limit_warning_sent
+from config import (
+    BOT_TOKEN, ADMIN_CHAT_ID, DEVELOPER_LINK, SPAM_INTERVAL_SECONDS,
+    ENABLE_MEMORY, ENABLE_DASHBOARD
+)
+from database import (
+    init_db, check_and_save_lead, increment_normal_request, increment_attack_attempt, 
+    log_security_threat, has_limit_warning_been_sent, mark_limit_warning_sent,
+    get_user_classification, classify_user, mark_user_as_spam, get_last_messages,
+    save_message_to_history
+)
 from ai_service import get_ai_response
 from security import validate_message, detect_prompt_injection, sanitize_message, is_spam_pattern
+
+# Условный импорт памяти (ТОЛЬКО если ENABLE_MEMORY = True)
+if ENABLE_MEMORY:
+    from memory_module import (
+        build_conversation_context, compress_conversation, 
+        detect_user_type, get_user_limit
+    )
+else:
+    # Пустышки - ничего не делают
+    def build_conversation_context(*args, **kwargs):
+        return ""
+    async def compress_conversation(*args, **kwargs):
+        pass
+    def detect_user_type(*args, **kwargs):
+        return "неизвестный"
+    def get_user_limit(classification):
+        return 10  # Базовый лимит для всех если память отключена
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,8 +48,8 @@ init_db()
 user_last_message_time = {}
 
 # Константы защиты
-MAX_NORMAL_REQUESTS_PER_DAY = 10  # 10 обычных вопросов в день
-MAX_ATTACK_ATTEMPTS = 3  # 3 попытки атак, потом блокировка на 24ч
+MAX_ATTACK_ATTEMPTS = 3
+BASE_MAX_REQUESTS = 10
 
 
 def get_contact_keyboard():
@@ -74,6 +99,7 @@ async def ai_dialog_handler(message: types.Message):
     # ========== ЗАЩИТА 3: Проверка на спам-паттерны ==========
     if is_spam_pattern(user_text):
         log_security_threat(user_id, "spam_pattern", user_text, "telegram")
+        mark_user_as_spam(user_id, "telegram")
         await message.answer("⚠️ Сообщение похоже на спам. Пожалуйста, напишите нормальный вопрос.")
         return
 
@@ -82,91 +108,93 @@ async def ai_dialog_handler(message: types.Message):
     if is_injection:
         log_security_threat(user_id, f"injection:{threat_type}", user_text, "telegram")
         
-        # Увеличиваем счётчик попыток атак
         allowed, remaining, is_blocked = increment_attack_attempt(user_id, "telegram", MAX_ATTACK_ATTEMPTS)
         
         if is_blocked:
-            # ЗАГЛУШКА НА 24 ЧАСА — БОТ МОЛЧИТ, НЕ ОТВЕЧАЕТ
-            logger.warning(f"🚨 ПОЛЬЗОВАТЕЛЬ ЗАБЛОКИРОВАН ЗА АТАКИ: {full_name} (@{username}) ID:{user_id}")
-            # Ничего не пишем, просто молчим!
+            logger.warning(f"🚨 ПОЛЬЗОВАТЕЛЬ ЗАБЛОКИРОВАН: {full_name} (@{username})")
             return
         
-        # Если ещё не заблокирован, пишем предупреждение
         await message.answer(
             f"🛡️ Наша система обнаружила попытку манипуляции.\n\n"
-            f"⚠️ Осталось попыток: {remaining}/{MAX_ATTACK_ATTEMPTS}\n"
-            f"После {MAX_ATTACK_ATTEMPTS} попыток вы будете заблокированы на 24 часа.",
+            f"⚠️ Осталось попыток: {remaining}/{MAX_ATTACK_ATTEMPTS}",
             reply_markup=get_contact_keyboard()
         )
         
-        # Уведомляем админа об атаке
         if ADMIN_CHAT_ID:
-            alert_text = (
-                f"🚨 <b>ПОПЫТКА АТАКИ:</b>\n\n"
-                f"👤 <b>Пользователь:</b> {full_name} (@{username})\n"
-                f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-                f"⚠️ <b>Тип угрозы:</b> {threat_type}\n"
-                f"💬 <b>Текст:</b> {user_text[:100]}\n"
-                f"📊 <b>Попыток атак:</b> {MAX_ATTACK_ATTEMPTS - remaining}/{MAX_ATTACK_ATTEMPTS}"
-            )
             try:
-                await bot.send_message(chat_id=ADMIN_CHAT_ID, text=alert_text, parse_mode="HTML")
-            except Exception as e:
-                logger.error(f"Не удалось отправить алерт админу: {e}")
+                await bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=f"🚨 АТАКА: {full_name} (@{username}) | Тип: {threat_type}",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
         return
 
-    # ========== ЗАЩИТА 5: Проверка лимита обычных вопросов ==========
-    allowed, remaining = increment_normal_request(user_id, "telegram", MAX_NORMAL_REQUESTS_PER_DAY)
+    # ========== ДИНАМИЧЕСКИЙ ЛИМИТ (если память включена) ==========
+    if ENABLE_MEMORY:
+        current_classification = get_user_classification(user_id, "telegram")
+        dynamic_limit = get_user_limit(current_classification)
+    else:
+        dynamic_limit = BASE_MAX_REQUESTS
+
+    # Проверяем лимит
+    allowed, remaining = increment_normal_request(user_id, "telegram", dynamic_limit)
     
     if not allowed:
-        # Лимит исчерпан - проверяем было ли уже сообщение об этом
         if not has_limit_warning_been_sent(user_id, "telegram"):
-            # Первый раз после исчерпания лимита - отправляем информативное сообщение
             await message.answer(
-                f"⏰ <b>Лимит 10 сообщений в сутки исчерпан.</b>\n\n"
+                f"⏰ <b>Лимит сообщений в сутки исчерпан.</b>\n\n"
                 f"По всем вопросам пишите разработчику 👇",
                 reply_markup=get_contact_keyboard()
             )
-            # Отмечаем что сообщение уже отправлено
             mark_limit_warning_sent(user_id, "telegram")
-            logger.info(f"⏰ ЛИМИТ ИСЧЕРПАН + СООБЩЕНИЕ ОТПРАВЛЕНО: {full_name} (@{username}) ID:{user_id}")
-        else:
-            # Уже отправляли сообщение - молчим 24ч
-            logger.info(f"⏰ ЛИМИТ ИСЧЕРПАН + МОЛЧИМ: {full_name} (@{username}) ID:{user_id}")
-        
         return
 
     # Фиксация нового лида
     is_new_lead = check_and_save_lead(user_id, username, full_name, user_text, platform="telegram")
 
     if is_new_lead and ADMIN_CHAT_ID:
-        lead_text = (
-            f"🔥 <b>НОВАЯ ЗАЯВКА / ЛИД:</b>\n\n"
-            f"👤 <b>Клиент:</b> {full_name} (@{username})\n"
-            f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-            f"📝 <b>Первый запрос:</b> {user_text}"
-        )
         try:
-            await bot.send_message(chat_id=ADMIN_CHAT_ID, text=lead_text, parse_mode="HTML")
-        except Exception as e:
-            logger.error(f"Не удалось отправить в группу админа: {e}")
+            await bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"🔥 ЛИД: {full_name} (@{username})\n💬 {user_text[:80]}...",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+
+    # ========== ПАМЯТЬ (если включена) ==========
+    conversation_context = ""
+    if ENABLE_MEMORY:
+        conversation_context = build_conversation_context(user_id, "telegram", max_messages=10)
+        asyncio.create_task(compress_conversation(user_id, "telegram"))
 
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     try:
-        ai_answer = await get_ai_response(user_text, full_name)
+        # Получаем ответ с контекстом (если память включена, иначе пустой контекст)
+        ai_answer = await get_ai_response(user_text, full_name, conversation_context)
         
-        # Добавляем информацию об оставшихся вопросах
-        remaining_info = f"\n\n📊 <i>Осталось вопросов сегодня: {remaining}/{MAX_NORMAL_REQUESTS_PER_DAY}</i>"
+        # Сохраняем в историю (если память включена)
+        if ENABLE_MEMORY:
+            save_message_to_history(user_id, user_text, ai_answer, "telegram")
+        
+        # Информация об оставшихся вопросах (только если есть лимит)
+        remaining_info = ""
+        if dynamic_limit < 100:
+            remaining_info = f"\n\n📊 <i>Осталось вопросов: {remaining}/{dynamic_limit}</i>"
+        
         await message.reply(ai_answer + remaining_info, reply_markup=get_contact_keyboard())
         
     except Exception as e:
-        logger.error(f"Ошибка при получении ответа от AI: {e}")
-        await message.reply("Произошла ошибка. Попробуйте повторить вопрос чуть позже.", reply_markup=get_contact_keyboard())
+        logger.error(f"❌ Ошибка: {e}")
+        await message.reply("Произошла ошибка. Попробуйте повторить вопрос.", reply_markup=get_contact_keyboard())
 
 
 async def main():
-    logger.info("🚀 Telegram-бот запущен (ФАЗА 1: 10 вопросов + 3 атаки с блокировкой)")
+    mode = "ПАМЯТЬ+ДАШБОРД" if ENABLE_MEMORY else "БАЗОВЫЙ"
+    logger.info(f"🚀 Бот запущен ({mode})")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
